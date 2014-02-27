@@ -24,6 +24,10 @@ use std::hashmap::HashMap;
 
 use extra::getopts;
 use extra::arc::MutexArc;
+use extra::arc::RWArc;
+
+use std::run::{Process, ProcessOptions};
+use std::io::{IoError, io_error};
 
 static SERVER_NAME : &'static str = "Zhtta Version 0.5";
 
@@ -41,7 +45,7 @@ static COUNTER_STYLE : &'static str = "<doctype !html><html><head><title>Hello, 
              </style></head>
              <body>";
 
-static mut visitor_count : uint = 0;
+
 
 struct HTTP_Request {
     // Use peer_name as the key to access TcpStream in hashmap. 
@@ -62,6 +66,8 @@ struct WebServer {
     
     notify_port: Port<()>,
     shared_notify_chan: SharedChan<()>,
+
+    counter: RWArc<uint>
 }
 
 impl WebServer {
@@ -79,7 +85,9 @@ impl WebServer {
             stream_map_arc: MutexArc::new(HashMap::new()),
             
             notify_port: notify_port,
-            shared_notify_chan: shared_notify_chan,        
+            shared_notify_chan: shared_notify_chan,
+
+            counter: RWArc::new(0)     
         }
     }
     
@@ -95,6 +103,8 @@ impl WebServer {
         let request_queue_arc = self.request_queue_arc.clone();
         let shared_notify_chan = self.shared_notify_chan.clone();
         let stream_map_arc = self.stream_map_arc.clone();
+
+        let counter_arc = self.counter.clone();
                 
         spawn(proc() {
             let mut acceptor = net::tcp::TcpListener::bind(addr).listen();
@@ -107,10 +117,18 @@ impl WebServer {
                 
                 let notify_chan = shared_notify_chan.clone();
                 let stream_map_arc = stream_map_arc.clone();
+
+                let (arc_port, arc_chan) = Chan::new();
+                arc_chan.send(counter_arc.clone());     // .clone isn't detected prior to complation, results in segfault later when trying to write to RWArc in process
                 
                 // Spawn a task to handle the connection.
                 spawn(proc() {
-                    unsafe { visitor_count += 1; } // TODO: Fix unsafe counter
+
+                    let local_counter = arc_port.recv();
+                    local_counter.write( |num| {        // Segfault caused here (see above comment)
+                        *num += 1;
+                    });
+
                     let request_queue_arc = queue_port.recv();
                   
                     let mut stream = stream;
@@ -139,7 +157,8 @@ impl WebServer {
                              
                         if path_str == ~"./" {
                             debug!("===== Counter Page request =====");
-                            WebServer::respond_with_counter_page(stream);
+
+                            WebServer::respond_with_counter_page(local_counter, stream);
                             debug!("=====Terminated connection from [{:s}].=====", peer_name);
                         } else if !path_obj.exists() || path_obj.is_dir() {
                             debug!("===== Error page request =====");
@@ -167,31 +186,103 @@ impl WebServer {
         stream.write(msg.as_bytes());
     }
 
-    // TODO: Safe visitor counter.
-    fn respond_with_counter_page(stream: Option<std::io::net::tcp::TcpStream>) {
+    // TODO: Safe visitor counter. (Completed?)
+    fn respond_with_counter_page(given_arc: RWArc<uint>, stream: Option<std::io::net::tcp::TcpStream>) {
         let mut stream = stream;
+        let arc = given_arc;
         let response: ~str = 
             format!("{:s}{:s}<h1>Greetings, Krusty!</h1>
                      <h2>Visitor count: {:u}</h2></body></html>\r\n", 
                     HTTP_OK, COUNTER_STYLE, 
-                    unsafe { visitor_count } );
+                    arc.read(|count| { *count }) );
         debug!("Responding to counter request");
-        stream.write(response.as_bytes());
+        stream.write(response.as_bytes());              
     }
     
-    // TODO: Streaming file.
+    // TODO: Streaming file. (Completed)
     // TODO: Application-layer file caching.
     fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
         let mut stream = stream;
         let mut file_reader = File::open(path).expect("Invalid file!");
+
         stream.write(HTTP_OK.as_bytes());
-        stream.write(file_reader.read_to_end());
+        loop {
+            let mut error = None;
+            let mut buffer: ~[u8] = ~[];
+            io_error::cond.trap(|e: IoError| {
+               error = Some(e);
+            }).inside(|| {
+                buffer = file_reader.read_bytes(4);
+            });
+
+            if error.is_some() {
+                break;
+            }
+            stream.write(buffer);
+            stream.flush();
+        }
     }
     
-    // TODO: Server-side gashing.
+    // TODO: Server-side gashing. (Completed)
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
-        // for now, just serve as static file
-        WebServer::respond_with_static_file(stream, path);
+        let mut stream = stream;
+        let mut file_reader = File::open(path).expect("Invalid file!");
+        let contents = file_reader.read_to_str();
+
+        let mut output = contents.clone();
+        let tags: ~[&str] = contents.split_str("<").collect();
+        for i in range(0, tags.len()) {
+            if tags[i].contains("#exec") {
+                let exec_tag: ~[&str] = tags[i].split_terminator('"').collect();
+                let cmd = exec_tag[1];
+
+                let (g_port, g_chan): (Port<~str>, Chan<~str>) = Chan::new();
+                let (cmd_port, cmd_chan): (Port<~str>, Chan<~str>) = Chan::new();
+                cmd_chan.send(cmd.to_owned());
+
+                spawn(proc (){
+                    let gash = Process::new( "../gash", &[~""], ProcessOptions::new());
+
+                    match gash {
+                        Some (mut g) => {                             
+                            {
+                                let gash = &mut g;
+                                let gash_in = gash.input();
+                                let cmd = cmd_port.recv();
+                                let bytes_in = cmd.as_bytes();
+                                //println!("Port recieved: {}\n\tAs bytes {}", cmd, bytes_in.to_str());
+                                gash_in.write(bytes_in);
+                            }
+                            g.close_input();
+                            {
+                                let gash = &mut g;
+                                let gash_out = gash.output();
+                                let result = gash_out.read_to_str();
+
+                                //println!("Unformated output written as {}", result);
+                                let str_out = result.replace("[www] gash > ","").replace("\n", "");
+
+                                //println!("Formatted output written as {}", str_out);
+                                g_chan.send(str_out);
+                            }
+                            g.close_outputs();
+                            g.finish();
+                        },
+                        None         => { println("Process was not created;"); }
+                    }
+                });
+
+                let gash_out = g_port.recv();
+                let mut tag = ~"<!--#exec cmd=\"";
+                tag = tag + cmd;        // For now just writing the gash command as replacement
+                tag = tag + "\" -->";
+                output = contents.replace(tag, gash_out);
+            }
+
+        }
+        //println!("{}", output);
+        stream.write(HTTP_OK.as_bytes());
+        stream.write(output.as_bytes());
     }
     
     // TODO: Smarter Scheduling.
@@ -223,8 +314,10 @@ impl WebServer {
         });
         
         notify_chan.send(()); // Send incoming notification to responder task.
-    
-    
+
+        // Print stream IP address
+        //println!("IP Address: {}", stream.unwrap().peer_name().unwrap().ip.clone().to_str() );
+
     }
     
     // TODO: Smarter Scheduling.
