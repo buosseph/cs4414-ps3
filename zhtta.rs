@@ -24,6 +24,10 @@ use std::hashmap::HashMap;
 
 use extra::getopts;
 use extra::arc::MutexArc;
+use extra::arc::RWArc;
+use extra::lru_cache::LruCache;
+
+use std::run::{Process, ProcessOptions};
 
 static SERVER_NAME : &'static str = "Zhtta Version 0.5";
 
@@ -41,7 +45,10 @@ static COUNTER_STYLE : &'static str = "<doctype !html><html><head><title>Hello, 
              </style></head>
              <body>";
 
-static mut visitor_count : uint = 0;
+static CACHE_SIZE : uint = 4;
+static BLOCK_SIZE : uint = 4;
+static FILE_SIZE_THRESHOLD : uint = 512;
+static MAX_NUM_OF_TASKS : uint = 128;
 
 struct HTTP_Request {
     // Use peer_name as the key to access TcpStream in hashmap. 
@@ -62,6 +69,10 @@ struct WebServer {
     
     notify_port: Port<()>,
     shared_notify_chan: SharedChan<()>,
+
+    counter_arc: RWArc<uint>,
+    semophore_arc: RWArc<uint>,
+    cache_arc: MutexArc<LruCache<Path, ~[u8]>>   // MutexArc required due to mentioned Freeze bug in Rust 0.9
 }
 
 impl WebServer {
@@ -79,7 +90,11 @@ impl WebServer {
             stream_map_arc: MutexArc::new(HashMap::new()),
             
             notify_port: notify_port,
-            shared_notify_chan: shared_notify_chan,        
+            shared_notify_chan: shared_notify_chan,
+
+            counter_arc: RWArc::new(0),
+            semophore_arc: RWArc::new(MAX_NUM_OF_TASKS),
+            cache_arc: MutexArc::new(LruCache::new(CACHE_SIZE))   
         }
     }
     
@@ -95,6 +110,11 @@ impl WebServer {
         let request_queue_arc = self.request_queue_arc.clone();
         let shared_notify_chan = self.shared_notify_chan.clone();
         let stream_map_arc = self.stream_map_arc.clone();
+
+        // add cache_arc?
+        let counter_arc = self.counter_arc.clone();
+        let cache_arc = self.cache_arc.clone();
+
                 
         spawn(proc() {
             let mut acceptor = net::tcp::TcpListener::bind(addr).listen();
@@ -107,10 +127,20 @@ impl WebServer {
                 
                 let notify_chan = shared_notify_chan.clone();
                 let stream_map_arc = stream_map_arc.clone();
+
+                let (arc_port, arc_chan) = Chan::new();
+                arc_chan.send(counter_arc.clone());     // .clone isn't detected prior to complation, results in segfault later when trying to write to RWArc in process
                 
+                let (cache_port, cache_chan) = Chan::new();
+                cache_chan.send(cache_arc.clone());
                 // Spawn a task to handle the connection.
                 spawn(proc() {
-                    unsafe { visitor_count += 1; } // TODO: Fix unsafe counter
+
+                    let local_counter = arc_port.recv();
+                    local_counter.write( |num| {        // Segfault caused here (see above comment)
+                        *num += 1;
+                    });
+
                     let request_queue_arc = queue_port.recv();
                   
                     let mut stream = stream;
@@ -139,7 +169,8 @@ impl WebServer {
                              
                         if path_str == ~"./" {
                             debug!("===== Counter Page request =====");
-                            WebServer::respond_with_counter_page(stream);
+
+                            WebServer::respond_with_counter_page(local_counter, stream);
                             debug!("=====Terminated connection from [{:s}].=====", peer_name);
                         } else if !path_obj.exists() || path_obj.is_dir() {
                             debug!("===== Error page request =====");
@@ -151,7 +182,15 @@ impl WebServer {
                             debug!("=====Terminated connection from [{:s}].=====", peer_name);
                         } else { 
                             debug!("===== Static Page request =====");
-                            WebServer::enqueue_static_file_request(stream, path_obj, stream_map_arc, request_queue_arc, notify_chan);
+                            if path_obj.stat().size.to_uint().unwrap() < FILE_SIZE_THRESHOLD {
+                                debug!("File size is under threshold. Immediately responding.");
+                                let cache_arc = cache_port.recv();
+                                WebServer::respond_with_static_file(stream, path_obj, cache_arc);
+                            }
+                            else {
+                                debug!("File size is larger than the threshold. Enqueuing request.");
+                                WebServer::enqueue_static_file_request(stream, path_obj, stream_map_arc, request_queue_arc, notify_chan);
+                            }
                         }
                     }
                 });
@@ -167,38 +206,135 @@ impl WebServer {
         stream.write(msg.as_bytes());
     }
 
-    // TODO: Safe visitor counter.
-    fn respond_with_counter_page(stream: Option<std::io::net::tcp::TcpStream>) {
+    // TODO: Safe visitor counter. (Completed)
+    fn respond_with_counter_page(given_arc: RWArc<uint>, stream: Option<std::io::net::tcp::TcpStream>) {
         let mut stream = stream;
+        let arc = given_arc;
         let response: ~str = 
             format!("{:s}{:s}<h1>Greetings, Krusty!</h1>
                      <h2>Visitor count: {:u}</h2></body></html>\r\n", 
                     HTTP_OK, COUNTER_STYLE, 
-                    unsafe { visitor_count } );
+                    arc.read(|count| { *count }) );
         debug!("Responding to counter request");
-        stream.write(response.as_bytes());
+        stream.write(response.as_bytes());              
     }
     
-    // TODO: Streaming file.
-    // TODO: Application-layer file caching.
-    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
+    // TODO: Streaming file. (Completed)
+    // TODO: Application-layer file caching (Completed)
+    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>, path: & Path, cache_arc: MutexArc<LruCache<Path, ~[u8]>>) {
+        let mut stream = stream;
+            cache_arc.access(|lru_cache| {
+                let mut buffer_to_cache: ~[u8] = ~[];
+                match lru_cache.get(path) {
+                    Some(buffer)  => {
+                        debug!("Found data in the cache!");
+                        stream.write(HTTP_OK.as_bytes());
+                        let buffer_size = buffer.len();
+                        let mut index = 0;
+                        while BLOCK_SIZE < (buffer_size - index) {
+                            let bytes = buffer.slice(index, index+BLOCK_SIZE);
+                            stream.write(bytes);
+                            index += BLOCK_SIZE;
+                            buffer_to_cache.push_all_move(bytes.to_owned());
+                        }
+                        let bytes = buffer.slice(index, buffer_size);
+                        stream.write(bytes);
+                        stream.flush();
+                        buffer_to_cache.push_all_move(bytes.to_owned());
+                    },
+                    None      => {
+                        debug!("File not in cache. Streaming from memory.");
+                        let mut file_reader = File::open(path).expect("Invalid file!");
+                        stream.write(HTTP_OK.as_bytes());
+                        let buffer_size = path.stat().size.to_uint().unwrap();
+                        let mut index = 0;
+                        while BLOCK_SIZE < (buffer_size - index) {
+                            let bytes = file_reader.read_bytes(BLOCK_SIZE);
+                            stream.write(bytes);
+                            index += BLOCK_SIZE;
+                            buffer_to_cache.push_all_move(bytes);
+                        }
+                        let bytes = file_reader.read_to_end();
+                        stream.write(bytes);
+                        stream.flush();
+                        buffer_to_cache.push_all_move(bytes);
+                    }
+                }
+                lru_cache.put(path.clone(), buffer_to_cache);
+                debug!("File data now cached");
+            });
+    }
+    
+    // TODO: Server-side gashing. (Completed)
+    fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
         let mut stream = stream;
         let mut file_reader = File::open(path).expect("Invalid file!");
+        let contents = file_reader.read_to_str();
+
+        let mut output = contents.clone();
+        let tags: ~[&str] = contents.split_str("<").collect();
+        for i in range(0, tags.len()) {
+            if tags[i].contains("#exec") {
+                let exec_tag: ~[&str] = tags[i].split_terminator('"').collect();
+                let cmd = exec_tag[1];
+
+                let (g_port, g_chan): (Port<~str>, Chan<~str>) = Chan::new();
+                let (cmd_port, cmd_chan): (Port<~str>, Chan<~str>) = Chan::new();
+                cmd_chan.send(cmd.to_owned());
+
+                spawn(proc (){
+                    let gash = Process::new( "../gash", &[~""], ProcessOptions::new());
+
+                    match gash {
+                        Some (mut g) => {                             
+                            {
+                                let gash = &mut g;
+                                let gash_in = gash.input();
+                                let cmd = cmd_port.recv();
+                                let bytes_in = cmd.as_bytes();
+                                //println!("Port recieved: {}\n\tAs bytes {}", cmd, bytes_in.to_str());
+                                gash_in.write(bytes_in);
+                            }
+                            g.close_input();
+                            {
+                                let gash = &mut g;
+                                let gash_out = gash.output();
+                                let result = gash_out.read_to_str();
+
+                                //println!("Unformated output written as {}", result);
+                                let str_out = result.replace("[www] gash > ","").replace("\n", "");
+
+                                //println!("Formatted output written as {}", str_out);
+                                g_chan.send(str_out);
+                            }
+                            g.close_outputs();
+                            g.finish();
+                        },
+                        None         => { println("Process was not created;"); }
+                    }
+                });
+
+                let gash_out = g_port.recv();
+                let mut tag = ~"<!--#exec cmd=\"";
+                tag = tag + cmd;        // For now just writing the gash command as replacement
+                tag = tag + "\" -->";
+                output = contents.replace(tag, gash_out);
+            }
+
+        }
+        //println!("{}", output);
         stream.write(HTTP_OK.as_bytes());
-        stream.write(file_reader.read_to_end());
-    }
-    
-    // TODO: Server-side gashing.
-    fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
-        // for now, just serve as static file
-        WebServer::respond_with_static_file(stream, path);
+        stream.write(output.as_bytes());
     }
     
     // TODO: Smarter Scheduling.
+    // WahooFirst scheduling (Completed?)
     fn enqueue_static_file_request(stream: Option<std::io::net::tcp::TcpStream>, path_obj: &Path, stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>, req_queue_arc: MutexArc<~[HTTP_Request]>, notify_chan: SharedChan<()>) {
         // Save stream in hashmap for later response.
         let mut stream = stream;
         let peer_name = WebServer::get_peer_name(&mut stream);
+        let ip_addr = WebServer::get_ip_address(&mut stream);
+        //let ip_addr =  &stream.unwrap().peer_name().unwrap().ip.clone().to_str().clone().to_owned();   // Running into issue when value is moved after being sent to channel
         let (stream_port, stream_chan) = Chan::new();
         stream_chan.send(stream);
         unsafe {
@@ -214,27 +350,46 @@ impl WebServer {
         let (req_port, req_chan) = Chan::new();
         req_chan.send(req);
 
+        // Check reqeuest IP to see if local
+        //println!("Peer Name; {}\n\tIP: {}", peer_name, ip_addr);
+
         debug!("Waiting for queue mutex lock.");
         req_queue_arc.access(|local_req_queue| {
             debug!("Got queue mutex lock.");
             let req: HTTP_Request = req_port.recv();
-            local_req_queue.push(req);
-            debug!("A new request enqueued, now the length of queue is {:u}.", local_req_queue.len());
+
+            // If local, insert into vector at index 0 (Give it highest priority)
+            if ip_addr.starts_with("128.143.") {
+                local_req_queue.insert(0, req);
+            }
+            else if ip_addr.starts_with("137.54.") {
+                local_req_queue.insert(0, req);
+            }
+            else {
+                // Else push onto "queue"
+                local_req_queue.push(req);  // "Not actually a queue, but I'mma call it a queue" queue (actually a vector)
+                debug!("A new request enqueued, now the length of queue is {:u}.", local_req_queue.len());
+            } 
         });
         
         notify_chan.send(()); // Send incoming notification to responder task.
-    
-    
+
+        // Print stream IP address
+        //println!("IP Address: {}", stream.unwrap().peer_name().unwrap().ip.clone().to_str() );
     }
     
     // TODO: Smarter Scheduling.
+    // Multiple Response Tasks (Completed?)
     fn dequeue_static_file_request(&mut self) {
+
         let req_queue_get = self.request_queue_arc.clone();
         let stream_map_get = self.stream_map_arc.clone();
+        let semophore_arc_get = self.semophore_arc.clone();
         
         // Port<> cannot be sent to another task. So we have to make this task as the main task that can access self.notify_port.
         
         let (request_port, request_chan) = Chan::new();
+
         loop {
             self.notify_port.recv();    // waiting for new request enqueued.
             
@@ -261,10 +416,31 @@ impl WebServer {
             }
             
             // TODO: Spawning more tasks to respond the dequeued requests concurrently. You may need a semophore to control the concurrency.
-            let stream = stream_port.recv();
-            WebServer::respond_with_static_file(stream, request.path);
-            // Close stream automatically.
-            debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
+            
+
+
+            // Completed???
+
+
+            let mut spaces_available = 0;
+            semophore_arc_get.read(|num| { spaces_available = *num; });
+            if spaces_available > 0 {
+                let semophore_arc = semophore_arc_get.clone();
+                let (cache_port, cache_chan) = Chan::new();
+                let cache_arc_get = self.cache_arc.clone();
+                cache_chan.send(cache_arc_get);
+                spawn(proc(){
+                    semophore_arc.write(|num| { *num -= 1; });
+                    let stream = stream_port.recv();
+                    let cache_arc = cache_port.recv();              
+                    WebServer::respond_with_static_file(stream, request.path, cache_arc);
+                    debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
+                    // Close stream automatically.
+                    semophore_arc.write(|num| { *num += 1; });
+                });
+            }
+
+                
         }
     }
     
@@ -276,6 +452,18 @@ impl WebServer {
                             None => (~"")
                          }
                        },
+            None => (~"")
+        }
+    }
+
+    fn get_ip_address(stream: &mut Option<std::io::net::tcp::TcpStream>) -> ~str {
+        match *stream {
+            Some (ref mut s) => {
+                match s.peer_name() {
+                    Some(pn) => {pn.ip.to_str()},
+                    None => (~"")
+                }
+            },
             None => (~"")
         }
     }
