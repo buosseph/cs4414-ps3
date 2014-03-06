@@ -292,7 +292,7 @@ impl WebServer {
                                 let gash_in = gash.input();
                                 let cmd = cmd_port.recv();
                                 let bytes_in = cmd.as_bytes();
-                                //println!("Port recieved: {}\n\tAs bytes {}", cmd, bytes_in.to_str());
+                                debug!("Port recieved: {}\n\tAs bytes {}", cmd, bytes_in.to_str());
                                 gash_in.write(bytes_in);
                             }
                             g.close_input();
@@ -301,10 +301,10 @@ impl WebServer {
                                 let gash_out = gash.output();
                                 let result = gash_out.read_to_str();
 
-                                //println!("Unformated output written as {}", result);
+                                debug!("Unformated output written as {}", result);
                                 let str_out = result.replace("[www] gash > ","").replace("\n", "");
 
-                                //println!("Formatted output written as {}", str_out);
+                                debug!("Formatted output written as {}", str_out);
                                 g_chan.send(str_out);
                             }
                             g.close_outputs();
@@ -316,25 +316,23 @@ impl WebServer {
 
                 let gash_out = g_port.recv();
                 let mut tag = ~"<!--#exec cmd=\"";
-                tag = tag + cmd;        // For now just writing the gash command as replacement
+                tag = tag + cmd;
                 tag = tag + "\" -->";
                 output = contents.replace(tag, gash_out);
             }
 
         }
-        //println!("{}", output);
         stream.write(HTTP_OK.as_bytes());
         stream.write(output.as_bytes());
     }
     
     // TODO: Smarter Scheduling.
-    // WahooFirst scheduling (Completed?)
+    // WahooFirst scheduling (Completed)
     fn enqueue_static_file_request(stream: Option<std::io::net::tcp::TcpStream>, path_obj: &Path, stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>, req_queue_arc: MutexArc<~[HTTP_Request]>, notify_chan: SharedChan<()>) {
         // Save stream in hashmap for later response.
         let mut stream = stream;
         let peer_name = WebServer::get_peer_name(&mut stream);
         let ip_addr = WebServer::get_ip_address(&mut stream);
-        //let ip_addr =  &stream.unwrap().peer_name().unwrap().ip.clone().to_str().clone().to_owned();   // Running into issue when value is moved after being sent to channel
         let (stream_port, stream_chan) = Chan::new();
         stream_chan.send(stream);
         unsafe {
@@ -350,8 +348,6 @@ impl WebServer {
         let (req_port, req_chan) = Chan::new();
         req_chan.send(req);
 
-        // Check reqeuest IP to see if local
-        //println!("Peer Name; {}\n\tIP: {}", peer_name, ip_addr);
 
         debug!("Waiting for queue mutex lock.");
         req_queue_arc.access(|local_req_queue| {
@@ -373,13 +369,10 @@ impl WebServer {
         });
         
         notify_chan.send(()); // Send incoming notification to responder task.
-
-        // Print stream IP address
-        //println!("IP Address: {}", stream.unwrap().peer_name().unwrap().ip.clone().to_str() );
     }
     
     // TODO: Smarter Scheduling.
-    // Multiple Response Tasks (Completed?)
+    // Multiple Response Tasks (Completed)
     fn dequeue_static_file_request(&mut self) {
 
         let req_queue_get = self.request_queue_arc.clone();
@@ -416,12 +409,6 @@ impl WebServer {
             }
             
             // TODO: Spawning more tasks to respond the dequeued requests concurrently. You may need a semophore to control the concurrency.
-            
-
-
-            // Completed???
-
-
             let mut spaces_available = 0;
             semophore_arc_get.read(|num| { spaces_available = *num; });
             if spaces_available > 0 {
